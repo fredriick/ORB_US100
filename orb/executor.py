@@ -56,6 +56,10 @@ class Executor:
         positions = mt5.positions_get(symbol=self.symbol) or []
         return any(p.magic == self.magic for p in positions)
 
+    def open_positions(self) -> list:
+        positions = mt5.positions_get(symbol=self.symbol) or []
+        return [p for p in positions if p.magic == self.magic]
+
     def _candidate_fillings(self, info) -> list[int]:
         modes = []
         if info.filling_mode & 1:
@@ -83,6 +87,73 @@ class Executor:
             info.volume_max,
             info.volume_step,
         )
+
+    def _reference_price(self, info) -> float | None:
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is not None:
+            price = tick.ask or tick.bid
+            if price:
+                return float(price)
+        rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 0, 1)
+        if rates is not None and len(rates):
+            return float(rates[-1]["close"])
+        return None
+
+    def self_test(self) -> bool:
+        """Validate the order pipeline with mt5.order_check (no order is sent)."""
+        info = mt5.symbol_info(self.symbol)
+        if info is None:
+            log.error("SELF-TEST failed: unknown symbol %s", self.symbol)
+            return False
+        price = self._reference_price(info)
+        if price is None:
+            log.error("SELF-TEST failed: no price available (market closed and no history)")
+            return False
+
+        equity = mt5.account_info().equity
+        lot = self._compute_lot(info, max(float(self.cfg.get("min_risk_points", 20.0)), 1.0))
+        print(f"  symbol      : {self.symbol} (digits {info.digits}, "
+              f"vol min {info.volume_min} step {info.volume_step})")
+        print(f"  account     : equity {equity:.2f} | lot_mode {self.exec_cfg.get('lot_mode')}")
+        print(f"  test price  : {price}")
+        print(f"  test volume : {lot}")
+
+        all_ok = True
+        for label, otype, px in (
+            ("BUY", mt5.ORDER_TYPE_BUY, price + 5 * info.point),
+            ("SELL", mt5.ORDER_TYPE_SELL, price - 5 * info.point),
+        ):
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "volume": lot if lot > 0 else info.volume_min,
+                "type": otype,
+                "price": px,
+                "deviation": int(self.exec_cfg.get("deviation_points", 50)),
+                "magic": self.magic,
+                "comment": "ORB selftest",
+                "type_time": mt5.ORDER_TIME_GTC,
+            }
+            result = None
+            for filling in self._candidate_fillings(info):
+                request["type_filling"] = filling
+                result = mt5.order_check(request)
+                if result is not None and result.retcode == 0:
+                    break
+            if result is None:
+                print(f"  {label}: order_check returned None ({mt5.last_error()})")
+                all_ok = False
+            elif result.retcode == 0:
+                print(f"  {label}: OK  (margin {result.margin:.2f}, "
+                      f"free-after {result.margin_free:.2f})")
+            else:
+                print(f"  {label}: FAILED retcode {result.retcode} ({result.comment})")
+                all_ok = False
+
+        if lot <= 0:
+            print("  note        : computed lot is 0 - order would be skipped at runtime")
+            all_ok = False
+        return all_ok
 
     def _dry_run(self, sig: Signal, side: str) -> None:
         info = mt5.symbol_info(self.symbol)

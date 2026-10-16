@@ -120,15 +120,21 @@ gantt
 
 ```bash
 # 1. Requirements: Windows + MetaTrader 5 terminal running & logged in
-pip install MetaTrader5
+pip install -r requirements.txt
 
-# 2. Run the signal-only bot (writes trades.csv, logs to bot.log)
+# 2. Validate the MT5 order pipeline without sending an order
+python main.py --selftest
+
+# 3. Run the signal-only bot (writes trades.csv, logs to bot.log)
 python main.py
 
-# 3. Backtest against real MT5 history
-python backtest.py --days 150
+# 4. Backtest against real MT5 history (+ stability across 4 chunks)
+python backtest.py --days 150 --windows 4
 
-# 4. Tests
+# 5. Parameter robustness sweep
+python sweep.py --days 150
+
+# 6. Tests
 python -m unittest discover -s tests
 ```
 
@@ -166,29 +172,41 @@ always the 09:30 ET open — DST-safe.
 | `allow_rearm` | `false` | Re-arm after a retest timeout |
 | `max_signals_per_day` | `1` | Daily signal cap |
 | `trend.*` | EMA 50/200 on H1 | Higher-timeframe filter |
-| `execution.lot_mode` | `risk_percent` | `risk_percent` or `fixed` |
-| `execution.risk_percent` | `1.0` | % of equity risked per trade |
+| `costs.spread_points` | `4.0` | Round-trip cost in index points (spread + slippage) |
+| `costs.commission_per_lot` | `0.0` | Round-trip commission per lot (converted to points) |
+| `risk.max_daily_loss_r` | `2.0` | Stop taking signals after this much realized loss in a day (`0` = off) |
+| `alerts.enabled` / `alerts.webhook_url` | `false` / `""` | Optional webhook alerts (Discord/Slack JSON). Prefer `ORB_WEBHOOK_URL` env var |
+| `execution.lot_mode` | `fixed` | `fixed` or `risk_percent` (demo equity is too small for `risk_percent`) |
+| `execution.risk_percent` | `1.0` | % of equity risked per trade (when `lot_mode = risk_percent`) |
 | `execution.fixed_lot` | `0.01` | Lot size when `lot_mode = fixed` |
 | `execution.magic` | `20261014` | Order tag to identify bot positions |
+
+> **Demo note:** with $85 equity, 1% risk over a ~20pt stop sizes to 0.004 lot — below
+> the 0.01 minimum — so `risk_percent` mode skips every trade. The demo therefore
+> defaults to `lot_mode: fixed`, `fixed_lot: 0.01` (~2.3% of this balance per trade).
 
 ---
 
 ## Backtest results (150 days, US100, 4-pt round-trip cost)
 
+Most recent run (`retest_close`, `retest_swing`, TP 2R, `min_risk_points` 20):
+
 ```
-signals            : 64  (TP 39 / SL 24 / EOD 1)
-win rate           : 62.5%
-net avg per signal : +0.69R
-net total          : +44.1R
-signals per day    : 0.49
+signals            : 77  (TP 45 / SL 30 / EOD 2)
+gross              : 59.7% WR  |  +0.78R avg  |  +60.4R total
+net (cost 4.0 pt)  : 59.7% WR  |  +0.62R avg  |  +47.9R total
+signals per day    : 0.51
 ```
+
+Split into 4 equal chunks, the edge holds in every chunk (net `+5.8R` / `+16.8R` /
+`+14.4R` / `+11.0R`) — i.e. it is not driven by one lucky period.
 
 `retest_close` (market entry) beats `limit` (entry at the boundary):
 
 | entry_mode | win rate | net avg | net total |
 |------------|----------|---------|-----------|
-| `limit` | 51.6% | +0.40R | +25.9R |
-| **`retest_close`** | **62.5%** | **+0.69R** | **+44.1R** |
+| `limit` | ~51% | +0.40R | +25.9R |
+| **`retest_close`** | **~60%** | **+0.62R** | **+47.9R** |
 
 ### Honest caveats
 
@@ -197,8 +215,13 @@ signals per day    : 0.49
 - **Sub-spread stops inflate results.** Raw retest swings can be ~1 point wide; the
   `min_risk_points = 20` floor exists to keep stops realistic. The edge is *sensitive* —
   a 40-point floor turns negative.
-- **The 1H EMA trend filter added no measurable edge** on this sample (kept per the
-  strategy description; set `trend.enabled: false` to compare).
+- **The 1H EMA trend filter added no measurable edge** — `sweep.py` shows `trend off`
+  yields more signals (**106 vs 77**) at a *higher* net total, i.e. the filter removes
+  net-positive trades. It is kept only to match the strategy description
+  (`trend.enabled: false` to compare).
+- **The sweep is a diagnostic, not a green light to optimize.** The "best" rows use
+  `min_risk_points: 10`, which reintroduces the unrealistic sub-20pt stops — textbook
+  overfitting. Prefer parameters that are stable *across* the grid, not the single peak.
 - Small sample, demo data, flat cost model. **Forward-test before risking capital.**
 
 ---
@@ -207,14 +230,18 @@ signals per day    : 0.49
 
 ```
 ORB/
-├── main.py            # live signal/dry-run loop + catch-up guard
-├── backtest.py        # replay engine over MT5 history
+├── main.py            # live signal/dry-run loop, --selftest, catch-up guard
+├── backtest.py        # replay over MT5 history (--windows, --offset, cost knobs)
+├── sweep.py           # parameter robustness grid
 ├── config.json        # all parameters
+├── requirements.txt
 ├── orb/
 │   ├── engine.py      # pure ORB state machine (unit-tested)
-│   ├── feed.py        # MT5 adapter + server-offset handling
+│   ├── replay.py      # shared replay + stats (used by backtest & sweep)
+│   ├── feed.py        # MT5 adapter, server-offset handling, auto-reconnect
 │   ├── trend.py       # EMA + H1 trend provider
-│   ├── executor.py    # lot sizing + order placement
+│   ├── executor.py    # lot sizing + order placement + order_check self-test
+│   ├── notify.py      # optional webhook alerts
 │   ├── ledger.py      # trades.csv writer
 │   └── models.py      # Bar / Zone / Signal / Direction
 └── tests/             # 33 unit tests
@@ -226,7 +253,14 @@ ORB/
 
 - **Signal-only by default.** Orders are placed only with `live_trading: true` or
   `python main.py --live`.
-- **One position at a time**, tagged with `execution.magic`.
+- **Validate before you trade.** `python main.py --selftest` runs `order_check` on a
+  sample BUY and SELL (no order is sent) to confirm symbol, filling mode, and margin.
+- **One position at a time**, tagged with `execution.magic`; any position left open from
+  a previous run is reported on startup (reconciliation).
+- **Daily loss limit** (`risk.max_daily_loss_r`): new signals are skipped once the day's
+  realized R hits the limit.
+- **Auto-reconnect**: the feed re-initializes the terminal if the connection drops.
+- **Bounded logs**: `bot.log` rotates at 2 MB, keeping 5 backups.
 - **Risk-based sizing** from live equity; skipped (not silently increased) if the
   budget cannot fund the minimum lot.
 - Not financial advice. Test on a demo account first.

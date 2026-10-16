@@ -63,15 +63,38 @@ class Mt5Feed:
     def offset(self) -> int:
         return self._offset
 
+    def ensure_connection(self) -> bool:
+        """Re-establish the terminal connection if it dropped. Returns health."""
+        ti = mt5.terminal_info()
+        if ti is None or not ti.connected:
+            log.warning("MT5 terminal not connected - reinitializing")
+            if not mt5.initialize():
+                log.error("reinitialize failed: %s", mt5.last_error())
+                return False
+            log.info("MT5 reconnected")
+        self._ensure_symbol()
+        return True
+
+    def _ensure_symbol(self) -> None:
+        info = mt5.symbol_info(self.symbol)
+        if info is None or not info.visible:
+            mt5.symbol_select(self.symbol, True)
+
     def bars(self, tf_minutes: int, count: int) -> list[Bar]:
         if tf_minutes not in _TF:
             raise ValueError(f"unsupported timeframe: {tf_minutes}m")
+        self._ensure_symbol()
         self._detect_offset()
         offset = self._offset
         raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
         if raw is None:
             log.warning("copy_rates_from_pos(%dm) failed: %s", tf_minutes, mt5.last_error())
-            return []
+            if not self.ensure_connection():
+                return []
+            raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
+            if raw is None:
+                log.error("copy_rates_from_pos(%dm) still failing after reconnect", tf_minutes)
+                return []
         now_raw = time.time() + offset
         out: list[Bar] = []
         for r in raw:

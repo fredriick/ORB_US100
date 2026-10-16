@@ -25,8 +25,20 @@
     "ema_slow": 200
   },
   "server_offset_sec_fallback": 10800,
+  "costs": {
+    "spread_points": 4.0,
+    "commission_per_lot": 0.0,
+    "value_per_point_per_lot": 10.0
+  },
+  "risk": {
+    "max_daily_loss_r": 2.0
+  },
+  "alerts": {
+    "enabled": false,
+    "webhook_url": ""
+  },
   "execution": {
-    "lot_mode": "risk_percent",
+    "lot_mode": "fixed",
     "risk_percent": 1.0,
     "fixed_lot": 0.01,
     "max_lot": 5.0,
