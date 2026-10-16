@@ -1,8 +1,8 @@
 # ORB US100 — Opening Range Breakout Bot (MetaTrader 5)
 
-A signal-only-first trading bot that implements the **Opening Range Breakout (ORB)**
-strategy on **Nasdaq (US100)** through MetaTrader 5, plus a backtester and a small,
-fully-tested strategy engine.
+A **signal-only-first** trading bot that implements the **Opening Range Breakout
+(ORB)** strategy on **Nasdaq (US100)** through MetaTrader 5, packaged with a
+backtester, a parameter-robustness lab and a small, fully-tested strategy engine.
 
 The rule set comes from a trader's description:
 
@@ -11,7 +11,27 @@ The rule set comes from a trader's description:
 > the 15 minute area, then enter on the retest, following the overall trend of the
 > higher timeframe market."
 
-Written in Python, MT5-connected, signal-only by default.
+Written in Python. It runs in two interchangeable ways:
+
+- **Local** — the `MetaTrader5` Python package talking to a terminal on the same
+  Windows machine (default; used for development and offline backtests).
+- **HTTP** — a plain REST client talking to a **dockerized MT5 terminal** on an
+  Ubuntu VPS, so the bot can run 24/7 without a PC.
+
+The engine is transport-agnostic: the same strategy, backtests and tools work over
+either transport. Orders are never sent unless `live_trading` is enabled.
+
+## Contents
+
+- [The strategy](#the-strategy)
+- [How the engine works](#how-the-engine-works)
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+- [Configuration](#configuration-configjson)
+- [Deployment (Ubuntu VPS + Docker)](#deployment-ubuntu-vps--docker)
+- [Backtest results](#backtest-results-150-days-us100-4-pt-round-trip-cost)
+- [Project structure](#project-structure)
+- [Safety](#safety)
 
 ---
 
@@ -31,77 +51,130 @@ Written in Python, MT5-connected, signal-only by default.
 
 ## How the engine works
 
-The core (`orb/engine.py`) is a pure, dependency-free state machine — no MT5, fully
-unit-tested.
+The core (`orb/engine.py`) is a pure, dependency-free state machine — **no MT5, fully
+unit-tested**. One instance drives one trading day; bars are fed in as completed UTC
+candles.
 
 ```mermaid
 stateDiagram-v2
     [*] --> WAITING
-    WAITING --> ARMED : 09:30-09:45 ORB candle closes
-    WAITING --> DONE : range too small / no data
-    ARMED --> AWAIT_RETEST : 5m close outside zone and trend allows
-    ARMED --> DONE : session cutoff
-    AWAIT_RETEST --> SIGNAL : price retests the broken level
-    AWAIT_RETEST --> DONE : no retest within N bars
-    AWAIT_RETEST --> ARMED : re-arm (optional)
-    SIGNAL --> [*] : TP / SL / end-of-day
+    WAITING --> ARMED : first 15m candle closes<br/>(range ≥ min_zone_range)
+    WAITING --> DONE : range too small / no ORB data
+
+    ARMED --> AWAIT_RETEST : 5m close beyond a boundary<br/>AND trend allows
+    ARMED --> ARMED : breakout rejected by trend filter
+    ARMED --> DONE : session cutoff (16:00 ET)
+
+    AWAIT_RETEST --> SIGNAL : price retests the broken boundary
+    AWAIT_RETEST --> ARMED : no retest within retest_timeout_bars<br/>(only if allow_rearm)
+    AWAIT_RETEST --> DONE : no retest (no re-arm) / cutoff
+
+    SIGNAL --> [*] : TP / SL / EOD exit
+    SIGNAL --> [*] : EXPIRED (signal never tracked)
+    DONE --> [*]
 ```
 
 Key decision points:
 
-- **Breakout confirmation** is a **5-minute close** beyond the boundary (not a wick).
-- **Trend filter** is evaluated at the breakout bar: `up` → longs only, `down` → shorts
-  only, `neutral` → both. Trend = `EMA50 > EMA200` on completed 1H bars.
-- **Retest** = a later 5m candle whose range reaches the broken boundary.
-- **Guards**: one signal/day, re-test timeout (`retest_timeout_bars`), a minimum stop
-  distance floor (`min_risk_points`), and a session cutoff for new setups.
+- **Breakout confirmation** is a **5-minute close** beyond the boundary (never a wick).
+- **Trend filter** is evaluated *at the breakout bar*: `up` → longs only, `down` →
+  shorts only, `neutral` → both. It is **off by default** (see findings).
+- **Retest** = a later 5m candle whose range reaches the broken boundary; the fill is
+  the boundary (or the approached price within `retest_buffer`, never optimistic).
+- **Stop** = the retest swing (or the opposite zone side), widened to at least
+  `min_risk_points` so sub-spread stops cannot inflate the backtest.
+- **Guards**: one signal/day (`max_signals_per_day`), a retest timeout
+  (`retest_timeout_bars`), and a session cutoff that blocks new setups.
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    MT5[(MetaTrader 5<br/>terminal<br/>local IPC or REST API)]
-    Client[orb.mt5_client<br/>LocalMt5Client / HttpMt5Client]
-    Feed[orb.feed<br/>bars + server-clock offset]
-    Engine[orb.engine<br/>ORB state machine]
-    Trend[orb.trend<br/>EMA 50/200 on H1]
-    Ledger[orb.ledger<br/>trades.csv]
-    Exec[orb.executor<br/>lot sizing + orders]
+The strategy never touches MT5 directly. Everything is expressed against a thin
+**client** whose implementation is chosen by `config.transport`.
 
-    MT5 -->|rates, ticks| Client
-    Client -->|normalized data| Feed
-    Feed -->|UTC bars| Engine
+```mermaid
+flowchart TB
+    subgraph core["Trading core — transport-agnostic"]
+        Feed["orb.feed<br/>market data → UTC bars"]
+        Engine["orb.engine<br/>ORB state machine"]
+        Trend["orb.trend / trend_methods<br/>regime: up / down / neutral"]
+        Exec["orb.executor<br/>lot sizing + orders"]
+        Ledger["orb.ledger<br/>trades.csv"]
+        Notify["orb.notify<br/>webhook alerts"]
+    end
+
+    Client{{"orb.mt5_client.build_client()<br/>selected by config.transport"}}
+
+    subgraph transports["Transports"]
+        Local["LocalMt5Client"]
+        Http["HttpMt5Client"]
+    end
+
+    WinTerm["MT5 terminal<br/>(Windows · local IPC)"]
+    VpsTerm["mt5-terminal container<br/>(Ubuntu/VPS · REST :8000)"]
+
+    Feed -->|tick · rates · symbol · account| Client
+    Exec -->|order_send · positions| Client
+    Client --> Local
+    Client --> Http
+    Local <-->|MetaTrader5 package| WinTerm
+    Http <-->|REST /api/v1| VpsTerm
+
+    Feed -->|completed bars| Engine
     Trend -->|up / down / neutral| Engine
-    Engine -->|Signal| Ledger
+    Engine --> Ledger
+    Engine --> Notify
     Engine -->|Signal| Exec
-    Exec -.->|live_trading=true only| Client
 ```
 
-A trading day, end to end:
+**Transports** (`orb.mt5_client`):
+
+| `transport` | Client | Endpoint | Use |
+|-------------|--------|----------|-----|
+| `local` *(default)* | `LocalMt5Client` | `MetaTrader5` package IPC | Windows / development |
+| `http` | `HttpMt5Client` | REST to a dockerized terminal | Ubuntu VPS, 24/7 |
+
+Override per run with `--transport http`.
+
+**A live session, end to end** (startup gate → poll loop → order):
 
 ```mermaid
 sequenceDiagram
-    participant MT5
+    autonumber
+    participant Main as main.py
+    participant Client as orb.mt5_client
+    participant Term as MT5 terminal
     participant Feed as orb.feed
     participant Eng as orb.engine
-    participant Trend as orb.trend
     participant Exec as orb.executor
 
-    loop every poll_seconds
-        Feed->>MT5: copy_rates (server time)
-        MT5-->>Feed: OHLC
-        Feed->>Eng: completed bars (converted to UTC)
+    Main->>Client: build_client(cfg)
+    Main->>Client: ensure_algo_trading()
+    Main->>Client: health()
+    Client->>Term: GET /health
+    Term-->>Client: connected, trade_allowed
+    Note over Main: reconcile open ORB positions
+
+    loop every poll_seconds (session window)
+        Main->>Feed: bars(15m) · bars(5m)
+        Feed->>Client: rates / tick
+        Client->>Term: rates / ticks
+        Term-->>Client: OHLC / bid·ask
+        Client-->>Feed: normalized data
+        Feed-->>Eng: completed UTC bars
+        Eng->>Eng: breakout → retest → Signal
+        alt live_trading
+            Eng->>Exec: execute(signal)
+            Exec->>Client: order_send(market + SL/TP)
+            Client->>Term: POST /api/v1/trading/order
+        else signal-only
+            Exec-->>Exec: dry-run log (no order)
+        end
     end
-    Eng->>Trend: trend at breakout bar
-    Trend-->>Eng: up / down / neutral
-    Note over Eng: breakout close → retest → SIGNAL
-    Eng->>Exec: signal (entry, sl, tp)
-    Exec-->>MT5: market order + SL/TP  (only if live_trading)
 ```
 
-Session timeline (America/New_York):
+**Session timeline** (America/New_York):
 
 ```mermaid
 gantt
@@ -109,11 +182,11 @@ gantt
     dateFormat HH:mm
     axisFormat %H:%M
     section Opening range
-    First 15m candle - mark zone :09:30, 15m
-    section Watch for setup
-    5m breakout + retest scan :09:45, 375m
+    Mark the first 15m candle              :09:30, 15m
+    section Trade window
+    Watch 5m closes for breakout + retest  :09:45, 375m
     section Exits
-    Session cutoff - close open trades :16:00, 5m
+    No new setups, flatten open trades     :16:00, 5m
 ```
 
 ---
@@ -143,37 +216,34 @@ python trendlab.py --days 150 --symbols US500,US30
 python select.py --days 150 --folds 4 --symbol US100 --symbols US30
 
 # 8. Forward-test parity: live trades.csv vs a backtest of the same period
-python forward.py --config config.json
+python forward.py
 
 # 9. Tests
 python -m unittest discover -s tests
 ```
 
-The bot connects to the running terminal, auto-detects the broker's server-clock
-offset (FBS = UTC+3), and aligns everything to `America/New_York` so the ORB candle is
+The bot connects to the terminal, auto-detects the broker's server-clock offset
+(FBS = UTC+3), and aligns everything to `America/New_York` so the ORB candle is
 always the 09:30 ET open — DST-safe.
 
 > On startup the bot **replays the current session** to stay restart-safe, but replayed
 > signals are **never executed** — only bars that complete while it is running can
 > trigger an order.
 
-### Transports (local IPC or HTTP)
+Running against a remote terminal instead of a local one:
 
-The bot talks to MT5 through a thin client (`orb.mt5_client`) selected by
-`config.transport`:
-
-| `transport` | Client | Use |
-|-------------|--------|-----|
-| `local` (default) | `LocalMt5Client` | Direct `MetaTrader5` package IPC — Windows/dev |
-| `http` | `HttpMt5Client` | REST to a dockerized terminal (see [Deployment](#deployment-ubuntu-vps--docker)) |
-
-Everything above the client (`orb.engine`, `orb.replay`, tools) is transport-agnostic,
-so backtests and live runs can use either. Override per run with `--transport http`.
-
+```bash
+pip install -r requirements.txt          # core only (no MetaTrader5 package)
+export ORB_API_KEY=...                    # or ORB_API_SEED=...
+python main.py --transport http --selftest
+python main.py --transport http
+```
 
 ---
 
 ## Configuration (`config.json`)
+
+### Transport & symbol
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -182,6 +252,11 @@ so backtests and live runs can use either. Override per run with `--transport ht
 | `api.base_url` | `http://mt5-terminal:8000` | Terminal API base URL (HTTP transport) |
 | `api.key_env` / `api.seed_env` | `ORB_API_KEY` / `ORB_API_SEED` | Env vars holding the API key or login seed |
 | `api.timeout_sec` | `10` | HTTP request timeout |
+
+### Strategy & session
+
+| Key | Default | Meaning |
+|-----|---------|---------|
 | `live_trading` | `false` | `false` = signal/dry-run only |
 | `poll_seconds` | `10` | Loop interval |
 | `timezone` | `America/New_York` | Market session timezone |
@@ -200,6 +275,11 @@ so backtests and live runs can use either. Override per run with `--transport ht
 | `retest_timeout_bars` | `12` | Cancel if no retest within N 5m bars |
 | `allow_rearm` | `false` | Re-arm after a retest timeout |
 | `max_signals_per_day` | `1` | Daily signal cap |
+
+### Filters, costs, risk & execution
+
+| Key | Default | Meaning |
+|-----|---------|---------|
 | `trend.enabled` | `false` | Higher-timeframe trend filter (off by default — see findings) |
 | `trend.method` | `ema_cross` | `ema_cross`, `price_ema200`, `ema_slope200`, `ema_slope50`, `adx_gate`, `prior_day` |
 | `costs.spread_points` | `4.0` | Round-trip cost in index points (spread + slippage) |
@@ -215,21 +295,41 @@ so backtests and live runs can use either. Override per run with `--transport ht
 > the 0.01 minimum — so `risk_percent` mode skips every trade. The demo therefore
 > defaults to `lot_mode: fixed`, `fixed_lot: 0.01` (~2.3% of this balance per trade).
 
+Environment variables (all optional): `ORB_CONFIG` (config path), `ORB_DATA_DIR`
+(where `trades.csv` and `bot.log` live), `ORB_WEBHOOK_URL`, plus the API vars above.
+
 ---
 
 ## Deployment (Ubuntu VPS + Docker)
 
-Run the bot 24/7 on the same VPS as a dockerized MT5 terminal so it no longer depends
-on a local Windows PC. The reference terminal image is
+Run the bot 24/7 **on the same VPS** as a dockerized MT5 terminal, so it no longer
+depends on a local PC. The reference terminal image is
 [`nodalytics/metatrader-terminal`](https://github.com/nodalytics/metatrader-terminal)
 (Wine-based MT5 exposing a **REST + WebSocket API**). The bot then uses
 `transport: "http"` and never imports the `MetaTrader5` package.
 
+```mermaid
+flowchart LR
+    Broker[("Broker<br/>FBS-Demo")]
+
+    subgraph VPS["Ubuntu VPS — Docker"]
+        subgraph NET["network: mt5net"]
+            Term["mt5-terminal<br/>Wine + MetaTrader 5<br/>REST + WS :8000"]
+            Bot["orb-bot<br/>main.py (transport: http)"]
+        end
+        Data[("./data<br/>trades.csv · bot.log")]
+        Bot --- Data
+    end
+
+    Bot -->|REST /api/v1| Term
+    Term -->|MT5 protocol · auto-login| Broker
+```
+
 ### 1. Terminal container
 
 Deploy the terminal image on the VPS (its own compose), logged into your broker and
-with AutoTrading enabled. Note its **service name / published port** — the bot reaches
-it at `http://<service>:8000` on a shared Docker network.
+with AutoTrading enabled. Note its **service name / port** — the bot reaches it at
+`http://<service>:8000` on a shared Docker network.
 
 ### 2. Bot container
 
@@ -240,7 +340,8 @@ docker compose up -d --build
 ```
 
 `docker-compose.yml` joins the terminal's network (`MT5_NETWORK`, default `mt5net`),
-mounts `./data` for `trades.csv` + `bot.log`, and restarts `unless-stopped`.
+mounts `./data` for `trades.csv` + `bot.log`, mounts `config.json` read-only, and
+restarts `unless-stopped`.
 
 ### 3. Verify before going live
 
@@ -252,34 +353,29 @@ docker compose run --rm orb-bot python main.py --selftest
 docker compose logs -f orb-bot
 ```
 
-On startup the bot logs `terminal health | connected=... trade_allowed=...`, ensures
-algo trading is enabled, and reconciles any position left open from a previous run.
-
-### Configuration via environment
-
-Secrets stay out of git: `ORB_API_KEY` (or `ORB_API_SEED` → the bot logs in for a key),
-`ORB_API_BASE_URL`, `ORB_WEBHOOK_URL`, `ORB_CONFIG`, `ORB_DATA_DIR`.
-
-> **API schema note.** The REST client parses responses tolerantly (several field
-> aliases) because exact param names are confirmed from the terminal's `/docs`. If your
-> deployment differs, adjust the mapping in `orb/mt5_client.py` (`HttpMt5Client`).
+On startup the bot logs `terminal health | connected=... trade_allowed=...`, enables
+algo trading, and reconciles any position left open from a previous run.
 
 ### Endpoints used
 
-| bot call | terminal endpoint |
+| Bot call | Terminal endpoint |
 |----------|-------------------|
+| auth | `POST /api/v1/auth/login` |
 | symbol info | `GET /api/v1/symbols/{symbol}` |
 | account info | `GET /api/v1/terminal/account/info` |
 | health | `GET /health`, `GET /api/v1/terminal/info` |
 | enable AutoTrading | `POST /api/v1/terminal/algo-trading` |
 | tick | `GET /api/v1/symbols/ticks/{symbol}` |
 | bars (recent) | `GET /api/v1/symbols/rates/pos` |
-| bars (history/backtest) | `GET /api/v1/symbols/rates/range` |
+| bars (history / backtest) | `GET /api/v1/symbols/rates/range` |
 | open positions | `GET /api/v1/positions/by_symbol/{symbol}` |
 | order check | `GET /api/v1/trading/order_check/{symbol}` |
 | place order | `POST /api/v1/trading/order` |
 | modify SL/TP | `POST /api/v1/positions/modify` |
-| auth | `POST /api/v1/auth/login` |
+
+> **API schema note.** The REST client parses responses tolerantly (several field
+> aliases) because exact param names are confirmed from the terminal's `/docs`. If your
+> deployment differs, adjust the mapping in `orb/mt5_client.py` (`HttpMt5Client`).
 
 ---
 
@@ -359,7 +455,8 @@ net, worst fold **+10.6R**, positive in **4/4** folds.
 - **The sweep is a diagnostic, not a green light to optimize.** The "best" rows use
   `min_risk_points: 10`, which reintroduces the unrealistic sub-20pt stops — textbook
   overfitting. Prefer parameters that are stable *across* the grid, not the single peak.
-- Small sample, demo data, flat cost model. **Forward-test before risking capital.**
+- Small sample, demo data, flat cost model. **Forward-test before risking capital** —
+  `forward.py` compares the live `trades.csv` against a backtest of the same period.
 
 ---
 
