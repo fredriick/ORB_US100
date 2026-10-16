@@ -80,21 +80,7 @@ class Mt5Feed:
         if info is None or not info.visible:
             mt5.symbol_select(self.symbol, True)
 
-    def bars(self, tf_minutes: int, count: int) -> list[Bar]:
-        if tf_minutes not in _TF:
-            raise ValueError(f"unsupported timeframe: {tf_minutes}m")
-        self._ensure_symbol()
-        self._detect_offset()
-        offset = self._offset
-        raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
-        if raw is None:
-            log.warning("copy_rates_from_pos(%dm) failed: %s", tf_minutes, mt5.last_error())
-            if not self.ensure_connection():
-                return []
-            raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
-            if raw is None:
-                log.error("copy_rates_from_pos(%dm) still failing after reconnect", tf_minutes)
-                return []
+    def _convert(self, raw, tf_minutes: int, offset: int) -> list[Bar]:
         now_raw = time.time() + offset
         out: list[Bar] = []
         for r in raw:
@@ -114,6 +100,39 @@ class Mt5Feed:
             )
         out.sort(key=lambda b: b.open_time)
         return out
+
+    def bars(self, tf_minutes: int, count: int) -> list[Bar]:
+        if tf_minutes not in _TF:
+            raise ValueError(f"unsupported timeframe: {tf_minutes}m")
+        self._ensure_symbol()
+        self._detect_offset()
+        offset = self._offset
+        raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
+        if raw is None:
+            log.warning("copy_rates_from_pos(%dm) failed: %s", tf_minutes, mt5.last_error())
+            if not self.ensure_connection():
+                return []
+            raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
+            if raw is None:
+                log.error("copy_rates_from_pos(%dm) still failing after reconnect", tf_minutes)
+                return []
+        return self._convert(raw, tf_minutes, offset)
+
+    def bars_range(self, tf_minutes: int, start, end) -> list[Bar]:
+        """Bars between two datetimes (triggers on-demand history download)."""
+        if tf_minutes not in _TF:
+            raise ValueError(f"unsupported timeframe: {tf_minutes}m")
+        self._ensure_symbol()
+        self._detect_offset()
+        offset = self._offset
+        raw = mt5.copy_rates_range(self.symbol, _TF[tf_minutes], start, end)
+        if raw is None or len(raw) == 0:
+            log.warning("copy_rates_range(%dm) returned nothing: %s", tf_minutes, mt5.last_error())
+            if self.ensure_connection():
+                raw = mt5.copy_rates_range(self.symbol, _TF[tf_minutes], start, end)
+            if raw is None or len(raw) == 0:
+                return []
+        return self._convert(raw, tf_minutes, offset)
 
     def shutdown(self) -> None:
         mt5.shutdown()

@@ -1,26 +1,14 @@
 from __future__ import annotations
 
-from bisect import bisect_right
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from .engine import OrbEngine
 from .models import Bar, Signal
-from .trend import trend_label
+from .trend_methods import build as build_trend_method
 
 
-def build_trend_fn(h1: list[Bar], cfg: dict):
-    opens = [b.close_time for b in h1]
-    closes = [b.close for b in h1]
-    fast = int(cfg.get("ema_fast", 50))
-    slow = int(cfg.get("ema_slow", 200))
-
-    def trend_at(t: datetime) -> str:
-        if not cfg.get("enabled", True):
-            return "neutral"
-        idx = bisect_right(opens, t)
-        return trend_label(closes[:idx], fast, slow)
-
-    return trend_at
+def build_trend_fn(h1: list[Bar], cfg: dict, tz=None):
+    return build_trend_method(h1, tz, cfg)
 
 
 def effective_cost_points(cfg: dict) -> float:
@@ -43,7 +31,7 @@ def replay(
     offset: int = 0,
 ) -> tuple[list[Signal], list, int]:
     """Replay the strategy day by day. Returns (signals, days_list, skipped_days)."""
-    trend_at = build_trend_fn(h1, cfg["trend"])
+    trend_at = build_trend_fn(h1, cfg["trend"], tz)
 
     by_day: dict = {}
     for b in m5:

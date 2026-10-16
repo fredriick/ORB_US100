@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -57,9 +57,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 def load_history(cfg: dict, days: int):
     feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)))
     feed.start()
-    h1 = feed.bars(60, int(cfg["trend"].get("ema_slow", 200)) * 2 + days * 24)
-    m15 = feed.bars(15, days * 100 + 400)
-    m5 = feed.bars(int(cfg.get("entry_timeframe_minutes", 5)), days * 320 + 400)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days + 45)
+    h1 = feed.bars_range(60, start, end)
+    m15 = feed.bars_range(15, start, end)
+    m5 = feed.bars_range(int(cfg.get("entry_timeframe_minutes", 5)), start, end)
     feed.shutdown()
     if not h1 or not m15 or not m5:
         raise SystemExit("not enough history in the terminal - open charts / scroll history first")

@@ -97,7 +97,7 @@ def main() -> None:
     tz = ZoneInfo(cfg["timezone"])
     feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)))
     feed.start()
-    trend = TrendProvider(feed, cfg["trend"])
+    trend = TrendProvider(feed, cfg["trend"], tz)
     ledger = TradeLedger(str(BASE / "trades.csv"))
     executor = Executor(cfg["symbol"], cfg)
     notifier = Notifier(cfg)

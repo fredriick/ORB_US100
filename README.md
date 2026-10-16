@@ -24,7 +24,7 @@ Written in Python, MT5-connected, signal-only by default.
 | 3 | Wait for a **5m candle to close outside** the zone (above high = long, below low = short). |
 | 4 | Wait for price to **retest** the broken boundary. |
 | 5 | **Enter** in the breakout direction (market at the retest candle's close). Stop beyond the retest swing; target = **2R**. |
-| 6 | Only take trades aligned with the **higher-timeframe trend** (1H EMA 50/200). |
+| 6 | *Optional* higher-timeframe trend filter (1H EMA 50/200) — **off by default** (see [Trend-filter findings](#trend-filter-findings)). |
 | 7 | One signal per day; exit at TP, SL, or session cutoff (16:00 ET). |
 
 ---
@@ -134,7 +134,10 @@ python backtest.py --days 150 --windows 4
 # 5. Parameter robustness sweep
 python sweep.py --days 150
 
-# 6. Tests
+# 6. Trend-filter lab (compares filter variants, no orders/writes)
+python trendlab.py --days 150 --symbols US500,US30
+
+# 7. Tests
 python -m unittest discover -s tests
 ```
 
@@ -171,7 +174,8 @@ always the 09:30 ET open — DST-safe.
 | `retest_timeout_bars` | `12` | Cancel if no retest within N 5m bars |
 | `allow_rearm` | `false` | Re-arm after a retest timeout |
 | `max_signals_per_day` | `1` | Daily signal cap |
-| `trend.*` | EMA 50/200 on H1 | Higher-timeframe filter |
+| `trend.enabled` | `false` | Higher-timeframe trend filter (off by default — see findings) |
+| `trend.method` | `ema_cross` | `ema_cross`, `price_ema200`, `ema_slope200`, `ema_slope50`, `adx_gate`, `prior_day` |
 | `costs.spread_points` | `4.0` | Round-trip cost in index points (spread + slippage) |
 | `costs.commission_per_lot` | `0.0` | Round-trip commission per lot (converted to points) |
 | `risk.max_daily_loss_r` | `2.0` | Stop taking signals after this much realized loss in a day (`0` = off) |
@@ -189,24 +193,46 @@ always the 09:30 ET open — DST-safe.
 
 ## Backtest results (150 days, US100, 4-pt round-trip cost)
 
-Most recent run (`retest_close`, `retest_swing`, TP 2R, `min_risk_points` 20):
+Default config (`retest_close`, `retest_swing`, TP 2R, `min_risk_points` 20, trend **off**):
 
 ```
-signals            : 77  (TP 45 / SL 30 / EOD 2)
-gross              : 59.7% WR  |  +0.78R avg  |  +60.4R total
-net (cost 4.0 pt)  : 59.7% WR  |  +0.62R avg  |  +47.9R total
-signals per day    : 0.51
+signals            : 105  (TP 61 / SL 42 / EOD 2)
+gross              : 58.1% WR  |  +0.76R avg  |  +79.5R total
+net (cost 4.0 pt)  : 58.1% WR  |  +0.59R avg  |  +62.4R total
+signals per day    : 0.70
 ```
 
-Split into 4 equal chunks, the edge holds in every chunk (net `+5.8R` / `+16.8R` /
-`+14.4R` / `+11.0R`) — i.e. it is not driven by one lucky period.
+Split into 4 equal chunks, the edge holds in every chunk (net `+10.6R` / `+23.7R` /
+`+14.9R` / `+13.2R`) — i.e. it is not driven by one lucky period.
 
 `retest_close` (market entry) beats `limit` (entry at the boundary):
 
 | entry_mode | win rate | net avg | net total |
 |------------|----------|---------|-----------|
 | `limit` | ~51% | +0.40R | +25.9R |
-| **`retest_close`** | **~60%** | **+0.62R** | **+47.9R** |
+| **`retest_close`** | **~58%** | **+0.59R** | **+62.4R** |
+
+### Trend-filter findings
+
+The strategy description calls for trading in the direction of the higher-timeframe
+trend. Tested rigorously (`trendlab.py`), that filter — in every variant — **does not
+add edge**:
+
+- On US100 the filter removes ~net-neutral trades: kept expectancy +0.607R vs removed
+  +0.586R — a difference whose bootstrap 95% CI spans zero. It also lowers net return
+  (+46.1R with `ema_cross` vs **+62.4R** with the filter off) at essentially the same
+  drawdown. No variant (`price_ema200`, `ema_slope200/50`, `adx_gate`, `prior_day`)
+  beats "off" on net R.
+- The same holds on **US30** (every filter reduces net R).
+- The direction buckets that look good (e.g. shorts in a "down" regime) do not persist
+  across sample halves — they are noise, not regime signal.
+- **The strategy is instrument-specific.** It is strongly positive on US100 (+62.4R) and
+  US30 (+45.4R) but **negative on US500** (−24.7R) over the same period, and no filter
+  rescues US500.
+
+Conclusion: the edge lives in the ORB breakout/retest mechanics and stop placement, not
+in the higher-timeframe trend. The filter is therefore **off by default**, but the
+machinery is kept and selectable (`trend.enabled`, `trend.method`) for research.
 
 ### Honest caveats
 
@@ -215,10 +241,6 @@ Split into 4 equal chunks, the edge holds in every chunk (net `+5.8R` / `+16.8R`
 - **Sub-spread stops inflate results.** Raw retest swings can be ~1 point wide; the
   `min_risk_points = 20` floor exists to keep stops realistic. The edge is *sensitive* —
   a 40-point floor turns negative.
-- **The 1H EMA trend filter added no measurable edge** — `sweep.py` shows `trend off`
-  yields more signals (**106 vs 77**) at a *higher* net total, i.e. the filter removes
-  net-positive trades. It is kept only to match the strategy description
-  (`trend.enabled: false` to compare).
 - **The sweep is a diagnostic, not a green light to optimize.** The "best" rows use
   `min_risk_points: 10`, which reintroduces the unrealistic sub-20pt stops — textbook
   overfitting. Prefer parameters that are stable *across* the grid, not the single peak.
@@ -233,18 +255,20 @@ ORB/
 ├── main.py            # live signal/dry-run loop, --selftest, catch-up guard
 ├── backtest.py        # replay over MT5 history (--windows, --offset, cost knobs)
 ├── sweep.py           # parameter robustness grid
+├── trendlab.py        # trend-filter variant comparison + significance
 ├── config.json        # all parameters
 ├── requirements.txt
 ├── orb/
 │   ├── engine.py      # pure ORB state machine (unit-tested)
 │   ├── replay.py      # shared replay + stats (used by backtest & sweep)
 │   ├── feed.py        # MT5 adapter, server-offset handling, auto-reconnect
-│   ├── trend.py       # EMA + H1 trend provider
+│   ├── trend.py       # TrendProvider (live) + EMA helpers
+│   ├── trend_methods.py # selectable trend/regime definitions
 │   ├── executor.py    # lot sizing + order placement + order_check self-test
 │   ├── notify.py      # optional webhook alerts
 │   ├── ledger.py      # trades.csv writer
 │   └── models.py      # Bar / Zone / Signal / Direction
-└── tests/             # 33 unit tests
+└── tests/             # 42 unit tests
 ```
 
 ---

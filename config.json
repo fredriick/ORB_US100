@@ -19,10 +19,14 @@
   "allow_rearm": false,
   "max_signals_per_day": 1,
   "trend": {
-    "enabled": true,
+    "enabled": false,
+    "method": "ema_cross",
     "timeframe_minutes": 60,
     "ema_fast": 50,
-    "ema_slow": 200
+    "ema_slow": 200,
+    "slope_lookback": 5,
+    "adx_period": 14,
+    "adx_threshold": 20.0
   },
   "server_offset_sec_fallback": 10800,
   "costs": {
