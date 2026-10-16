@@ -1,7 +1,7 @@
-# ORB US100 — Opening Range Breakout Bot (MetaTrader 5)
+# ORB US100 Bot (MetaTrader 5)
 
-A **signal-only-first** trading bot that implements the **Opening Range Breakout
-(ORB)** strategy on **Nasdaq (US100)** through MetaTrader 5, packaged with a
+A **signal-only-first** trading bot that implements the **ORB** strategy on
+**Nasdaq (US100)** through MetaTrader 5, packaged with a
 backtester, a parameter-robustness lab and a small, fully-tested strategy engine.
 
 The rule set comes from a trader's description:
