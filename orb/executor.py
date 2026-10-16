@@ -3,9 +3,21 @@ from __future__ import annotations
 import logging
 import math
 
-import MetaTrader5 as mt5
-
 from .models import Direction, Signal
+from .mt5_client import (
+    ORDER_FILLING_FOK,
+    ORDER_FILLING_IOC,
+    ORDER_FILLING_RETURN,
+    ORDER_TIME_GTC,
+    ORDER_TYPE_BUY,
+    ORDER_TYPE_SELL,
+    TRADE_ACTION_DEAL,
+    TRADE_RETCODE_DONE,
+    TRADE_RETCODE_INVALID_FILL,
+    TRADE_RETCODE_REJECT,
+    Mt5Client,
+    build_client,
+)
 
 log = logging.getLogger("orb.exec")
 
@@ -44,30 +56,29 @@ def calc_lot(
 
 
 class Executor:
-    """Places real MT5 orders. No-op logging until config.live_trading is true."""
+    """Places real orders via an Mt5Client. No-op logging until live_trading."""
 
-    def __init__(self, symbol: str, cfg: dict):
+    def __init__(self, symbol: str, cfg: dict, client: Mt5Client | None = None):
         self.symbol = symbol
         self.cfg = cfg
         self.exec_cfg = cfg.get("execution", {})
         self.magic = int(self.exec_cfg.get("magic", 20261014))
+        self.client = client or build_client({"transport": "local"})
 
     def has_position(self) -> bool:
-        positions = mt5.positions_get(symbol=self.symbol) or []
-        return any(p.magic == self.magic for p in positions)
+        return any(p.magic == self.magic for p in self.client.positions(self.symbol))
 
     def open_positions(self) -> list:
-        positions = mt5.positions_get(symbol=self.symbol) or []
-        return [p for p in positions if p.magic == self.magic]
+        return [p for p in self.client.positions(self.symbol) if p.magic == self.magic]
 
     def _candidate_fillings(self, info) -> list[int]:
         modes = []
         if info.filling_mode & 1:
-            modes.append(mt5.ORDER_FILLING_FOK)
+            modes.append(ORDER_FILLING_FOK)
         if info.filling_mode & 2:
-            modes.append(mt5.ORDER_FILLING_IOC)
+            modes.append(ORDER_FILLING_IOC)
         if not modes:
-            modes.append(mt5.ORDER_FILLING_RETURN)
+            modes.append(ORDER_FILLING_RETURN)
         return modes
 
     def _compute_lot(self, info, sl_distance: float) -> float:
@@ -76,7 +87,7 @@ class Executor:
             lots = float(self.exec_cfg.get("fixed_lot", info.volume_min))
             lots = math.floor(lots / info.volume_step) * info.volume_step
             return max(info.volume_min, min(info.volume_max, round(lots, _decimals(info.volume_step))))
-        equity = mt5.account_info().equity
+        equity = self.client.account_info().equity
         return calc_lot(
             equity,
             float(self.exec_cfg.get("risk_percent", 1.0)),
@@ -89,19 +100,19 @@ class Executor:
         )
 
     def _reference_price(self, info) -> float | None:
-        tick = mt5.symbol_info_tick(self.symbol)
+        tick = self.client.tick(self.symbol)
         if tick is not None:
             price = tick.ask or tick.bid
             if price:
                 return float(price)
-        rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 0, 1)
-        if rates is not None and len(rates):
+        rates = self.client.rates(self.symbol, 1, 1)
+        if rates:
             return float(rates[-1]["close"])
         return None
 
     def self_test(self) -> bool:
-        """Validate the order pipeline with mt5.order_check (no order is sent)."""
-        info = mt5.symbol_info(self.symbol)
+        """Validate the order pipeline with order_check (no order is sent)."""
+        info = self.client.symbol_info(self.symbol)
         if info is None:
             log.error("SELF-TEST failed: unknown symbol %s", self.symbol)
             return False
@@ -110,8 +121,9 @@ class Executor:
             log.error("SELF-TEST failed: no price available (market closed and no history)")
             return False
 
-        equity = mt5.account_info().equity
+        equity = self.client.account_info().equity
         lot = self._compute_lot(info, max(float(self.cfg.get("min_risk_points", 20.0)), 1.0))
+        print(f"  transport   : {type(self.client).__name__}")
         print(f"  symbol      : {self.symbol} (digits {info.digits}, "
               f"vol min {info.volume_min} step {info.volume_step})")
         print(f"  account     : equity {equity:.2f} | lot_mode {self.exec_cfg.get('lot_mode')}")
@@ -120,11 +132,11 @@ class Executor:
 
         all_ok = True
         for label, otype, px in (
-            ("BUY", mt5.ORDER_TYPE_BUY, price + 5 * info.point),
-            ("SELL", mt5.ORDER_TYPE_SELL, price - 5 * info.point),
+            ("BUY", ORDER_TYPE_BUY, price + 5 * info.point),
+            ("SELL", ORDER_TYPE_SELL, price - 5 * info.point),
         ):
             request = {
-                "action": mt5.TRADE_ACTION_DEAL,
+                "action": TRADE_ACTION_DEAL,
                 "symbol": self.symbol,
                 "volume": lot if lot > 0 else info.volume_min,
                 "type": otype,
@@ -132,16 +144,16 @@ class Executor:
                 "deviation": int(self.exec_cfg.get("deviation_points", 50)),
                 "magic": self.magic,
                 "comment": "ORB selftest",
-                "type_time": mt5.ORDER_TIME_GTC,
+                "type_time": ORDER_TIME_GTC,
             }
             result = None
             for filling in self._candidate_fillings(info):
                 request["type_filling"] = filling
-                result = mt5.order_check(request)
+                result = self.client.order_check(request)
                 if result is not None and result.retcode == 0:
                     break
             if result is None:
-                print(f"  {label}: order_check returned None ({mt5.last_error()})")
+                print(f"  {label}: order_check returned None ({self.client.last_error()})")
                 all_ok = False
             elif result.retcode == 0:
                 print(f"  {label}: OK  (margin {result.margin:.2f}, "
@@ -156,8 +168,8 @@ class Executor:
         return all_ok
 
     def _dry_run(self, sig: Signal, side: str) -> None:
-        info = mt5.symbol_info(self.symbol)
-        tick = mt5.symbol_info_tick(self.symbol)
+        info = self.client.symbol_info(self.symbol)
+        tick = self.client.tick(self.symbol)
         if info is None or tick is None:
             log.info(
                 "PAPER %s | plan entry %.2f SL %.2f TP %.2f | no tick (market closed), "
@@ -190,8 +202,8 @@ class Executor:
             log.warning("%s signal ignored: an ORB position is already open", side)
             return None
 
-        info = mt5.symbol_info(self.symbol)
-        tick = mt5.symbol_info_tick(self.symbol)
+        info = self.client.symbol_info(self.symbol)
+        tick = self.client.tick(self.symbol)
         if info is None or tick is None:
             log.error("%s signal ignored: no market data (market closed?)", side)
             return None
@@ -208,7 +220,7 @@ class Executor:
 
         lot = self._compute_lot(info, risk_dist)
         if lot <= 0:
-            equity = mt5.account_info().equity
+            equity = self.client.account_info().equity
             log.warning(
                 "%s signal skipped: computed lot 0 (equity %.2f, risk distance %.2f pts, "
                 "risk_percent %.2f) - increase equity/risk_percent or use fixed lot",
@@ -220,27 +232,27 @@ class Executor:
             return None
 
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
+            "action": TRADE_ACTION_DEAL,
             "symbol": self.symbol,
             "volume": lot,
-            "type": mt5.ORDER_TYPE_BUY if is_long else mt5.ORDER_TYPE_SELL,
+            "type": ORDER_TYPE_BUY if is_long else ORDER_TYPE_SELL,
             "price": price,
             "sl": sl,
             "tp": tp,
             "deviation": int(self.exec_cfg.get("deviation_points", 50)),
             "magic": self.magic,
             "comment": "ORB",
-            "type_time": mt5.ORDER_TIME_GTC,
+            "type_time": ORDER_TIME_GTC,
         }
 
         last = None
         for filling in self._candidate_fillings(info):
             request["type_filling"] = filling
-            last = mt5.order_send(request)
+            last = self.client.order_send(request)
             if last is None:
-                log.error("order_send returned None: %s", mt5.last_error())
+                log.error("order_send returned None: %s", self.client.last_error())
                 continue
-            if last.retcode == mt5.TRADE_RETCODE_DONE:
+            if last.retcode == TRADE_RETCODE_DONE:
                 log.info(
                     "ORDER FILLED %s %.3f lot @ %.2f | SL %.2f TP %.2f | ticket %s",
                     side,
@@ -257,10 +269,7 @@ class Executor:
                     "sl": sl,
                     "tp": tp,
                 }
-            if last.retcode not in (
-                mt5.TRADE_RETCODE_INVALID_FILL,
-                mt5.TRADE_RETCODE_REJECT,
-            ):
+            if last.retcode not in (TRADE_RETCODE_INVALID_FILL, TRADE_RETCODE_REJECT):
                 break
 
         if last is not None:

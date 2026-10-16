@@ -1,5 +1,12 @@
 {
   "symbol": "US100",
+  "transport": "local",
+  "api": {
+    "base_url": "http://mt5-terminal:8000",
+    "key_env": "ORB_API_KEY",
+    "seed_env": "ORB_API_SEED",
+    "timeout_sec": 10
+  },
   "live_trading": false,
   "poll_seconds": 10,
   "timezone": "America/New_York",

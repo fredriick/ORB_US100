@@ -62,19 +62,21 @@ Key decision points:
 
 ```mermaid
 flowchart LR
-    MT5[(MetaTrader 5<br/>terminal)]
+    MT5[(MetaTrader 5<br/>terminal<br/>local IPC or REST API)]
+    Client[orb.mt5_client<br/>LocalMt5Client / HttpMt5Client]
     Feed[orb.feed<br/>bars + server-clock offset]
     Engine[orb.engine<br/>ORB state machine]
     Trend[orb.trend<br/>EMA 50/200 on H1]
     Ledger[orb.ledger<br/>trades.csv]
     Exec[orb.executor<br/>lot sizing + orders]
 
-    MT5 -->|rates, ticks| Feed
+    MT5 -->|rates, ticks| Client
+    Client -->|normalized data| Feed
     Feed -->|UTC bars| Engine
     Trend -->|up / down / neutral| Engine
     Engine -->|Signal| Ledger
     Engine -->|Signal| Exec
-    Exec -.->|live_trading=true only| MT5
+    Exec -.->|live_trading=true only| Client
 ```
 
 A trading day, end to end:
@@ -120,9 +122,9 @@ gantt
 
 ```bash
 # 1. Requirements: Windows + MetaTrader 5 terminal running & logged in
-pip install -r requirements.txt
+pip install -r requirements-local.txt   # core + MetaTrader5 (local IPC)
 
-# 2. Validate the MT5 order pipeline without sending an order
+# 2. Validate the order pipeline without sending an order
 python main.py --selftest
 
 # 3. Run the signal-only bot (writes trades.csv, logs to bot.log)
@@ -140,7 +142,10 @@ python trendlab.py --days 150 --symbols US500,US30
 # 7. Robust walk-forward parameter selection
 python select.py --days 150 --folds 4 --symbol US100 --symbols US30
 
-# 8. Tests
+# 8. Forward-test parity: live trades.csv vs a backtest of the same period
+python forward.py --config config.json
+
+# 9. Tests
 python -m unittest discover -s tests
 ```
 
@@ -152,6 +157,20 @@ always the 09:30 ET open — DST-safe.
 > signals are **never executed** — only bars that complete while it is running can
 > trigger an order.
 
+### Transports (local IPC or HTTP)
+
+The bot talks to MT5 through a thin client (`orb.mt5_client`) selected by
+`config.transport`:
+
+| `transport` | Client | Use |
+|-------------|--------|-----|
+| `local` (default) | `LocalMt5Client` | Direct `MetaTrader5` package IPC — Windows/dev |
+| `http` | `HttpMt5Client` | REST to a dockerized terminal (see [Deployment](#deployment-ubuntu-vps--docker)) |
+
+Everything above the client (`orb.engine`, `orb.replay`, tools) is transport-agnostic,
+so backtests and live runs can use either. Override per run with `--transport http`.
+
+
 ---
 
 ## Configuration (`config.json`)
@@ -159,6 +178,10 @@ always the 09:30 ET open — DST-safe.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `symbol` | `US100` | Broker's Nasdaq CFD symbol |
+| `transport` | `local` | `local` (MT5 IPC) or `http` (terminal REST API) |
+| `api.base_url` | `http://mt5-terminal:8000` | Terminal API base URL (HTTP transport) |
+| `api.key_env` / `api.seed_env` | `ORB_API_KEY` / `ORB_API_SEED` | Env vars holding the API key or login seed |
+| `api.timeout_sec` | `10` | HTTP request timeout |
 | `live_trading` | `false` | `false` = signal/dry-run only |
 | `poll_seconds` | `10` | Loop interval |
 | `timezone` | `America/New_York` | Market session timezone |
@@ -191,6 +214,72 @@ always the 09:30 ET open — DST-safe.
 > **Demo note:** with $85 equity, 1% risk over a ~20pt stop sizes to 0.004 lot — below
 > the 0.01 minimum — so `risk_percent` mode skips every trade. The demo therefore
 > defaults to `lot_mode: fixed`, `fixed_lot: 0.01` (~2.3% of this balance per trade).
+
+---
+
+## Deployment (Ubuntu VPS + Docker)
+
+Run the bot 24/7 on the same VPS as a dockerized MT5 terminal so it no longer depends
+on a local Windows PC. The reference terminal image is
+[`nodalytics/metatrader-terminal`](https://github.com/nodalytics/metatrader-terminal)
+(Wine-based MT5 exposing a **REST + WebSocket API**). The bot then uses
+`transport: "http"` and never imports the `MetaTrader5` package.
+
+### 1. Terminal container
+
+Deploy the terminal image on the VPS (its own compose), logged into your broker and
+with AutoTrading enabled. Note its **service name / published port** — the bot reaches
+it at `http://<service>:8000` on a shared Docker network.
+
+### 2. Bot container
+
+```bash
+cp .env.example .env     # fill in ORB_API_KEY (or ORB_API_SEED) and MT5_NETWORK
+# set "transport": "http" in config.json (or pass --transport http)
+docker compose up -d --build
+```
+
+`docker-compose.yml` joins the terminal's network (`MT5_NETWORK`, default `mt5net`),
+mounts `./data` for `trades.csv` + `bot.log`, and restarts `unless-stopped`.
+
+### 3. Verify before going live
+
+```bash
+# startup health gate + order_check through the API
+docker compose run --rm orb-bot python main.py --selftest
+
+# watch the signal-only loop
+docker compose logs -f orb-bot
+```
+
+On startup the bot logs `terminal health | connected=... trade_allowed=...`, ensures
+algo trading is enabled, and reconciles any position left open from a previous run.
+
+### Configuration via environment
+
+Secrets stay out of git: `ORB_API_KEY` (or `ORB_API_SEED` → the bot logs in for a key),
+`ORB_API_BASE_URL`, `ORB_WEBHOOK_URL`, `ORB_CONFIG`, `ORB_DATA_DIR`.
+
+> **API schema note.** The REST client parses responses tolerantly (several field
+> aliases) because exact param names are confirmed from the terminal's `/docs`. If your
+> deployment differs, adjust the mapping in `orb/mt5_client.py` (`HttpMt5Client`).
+
+### Endpoints used
+
+| bot call | terminal endpoint |
+|----------|-------------------|
+| symbol info | `GET /api/v1/symbols/{symbol}` |
+| account info | `GET /api/v1/terminal/account/info` |
+| health | `GET /health`, `GET /api/v1/terminal/info` |
+| enable AutoTrading | `POST /api/v1/terminal/algo-trading` |
+| tick | `GET /api/v1/symbols/ticks/{symbol}` |
+| bars (recent) | `GET /api/v1/symbols/rates/pos` |
+| bars (history/backtest) | `GET /api/v1/symbols/rates/range` |
+| open positions | `GET /api/v1/positions/by_symbol/{symbol}` |
+| order check | `GET /api/v1/trading/order_check/{symbol}` |
+| place order | `POST /api/v1/trading/order` |
+| modify SL/TP | `POST /api/v1/positions/modify` |
+| auth | `POST /api/v1/auth/login` |
 
 ---
 
@@ -278,24 +367,31 @@ net, worst fold **+10.6R**, positive in **4/4** folds.
 
 ```
 ORB/
-├── main.py            # live signal/dry-run loop, --selftest, catch-up guard
+├── main.py            # live signal/dry-run loop, --selftest, --transport, catch-up guard
 ├── backtest.py        # replay over MT5 history (--windows, --offset, cost knobs)
+├── forward.py         # forward-test parity: live trades.csv vs same-period backtest
 ├── sweep.py           # parameter robustness grid
 ├── trendlab.py        # trend-filter variant comparison + significance
 ├── select.py          # robust walk-forward config selection
 ├── config.json        # all parameters
-├── requirements.txt
+├── Dockerfile         # bot image (core requirements only, no MetaTrader5 package)
+├── docker-compose.yml # joins the mt5-terminal network; mounts ./data
+├── .env.example       # ORB_API_KEY/SEED, base URL, webhook, network
+├── requirements.txt   # core (http transport): tzdata
+├── requirements-local.txt  # + MetaTrader5 for local IPC
 ├── orb/
 │   ├── engine.py      # pure ORB state machine (unit-tested)
 │   ├── replay.py      # shared replay + stats (used by backtest & sweep)
-│   ├── feed.py        # MT5 adapter, server-offset handling, auto-reconnect
+│   ├── feed.py        # market-data adapter over an Mt5Client; server-offset, reconnect
+│   ├── mt5_client.py  # transport layer: LocalMt5Client (IPC) + HttpMt5Client (REST)
+│   ├── settings.py    # env-based config/data-dir resolution
 │   ├── trend.py       # TrendProvider (live) + EMA helpers
 │   ├── trend_methods.py # selectable trend/regime definitions
 │   ├── executor.py    # lot sizing + order placement + order_check self-test
 │   ├── notify.py      # optional webhook alerts
 │   ├── ledger.py      # trades.csv writer
 │   └── models.py      # Bar / Zone / Signal / Direction
-└── tests/             # 42 unit tests
+└── tests/             # 70 unit tests
 ```
 
 ---
@@ -311,6 +407,8 @@ ORB/
 - **Daily loss limit** (`risk.max_daily_loss_r`): new signals are skipped once the day's
   realized R hits the limit.
 - **Auto-reconnect**: the feed re-initializes the terminal if the connection drops.
+- **Startup health gate**: the bot checks terminal health (`connected`, `trade_allowed`)
+  and enables AutoTrading before the loop starts.
 - **Bounded logs**: `bot.log` rotates at 2 MB, keeping 5 backups.
 - **Risk-based sizing** from live equity; skipped (not silently increased) if the
   budget cannot fund the minimum lot.

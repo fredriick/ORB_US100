@@ -1,0 +1,20 @@
+services:
+  orb-bot:
+    build: .
+    image: orb-bot:latest
+    container_name: orb-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - ORB_API_BASE_URL=${ORB_API_BASE_URL:-http://mt5-terminal:8000}
+      - ORB_DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
+    networks:
+      - mt5net
+
+networks:
+  mt5net:
+    external: true
+    name: ${MT5_NETWORK:-mt5net}

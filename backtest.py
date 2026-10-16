@@ -8,7 +8,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from orb.feed import Mt5Feed
+from orb.mt5_client import build_client
 from orb.replay import effective_cost_points, replay, summarize, windows
+from orb.settings import config_path
 
 BASE = Path(__file__).resolve().parent
 
@@ -41,7 +43,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--days", type=int, default=45)
     parser.add_argument("--offset", type=int, default=0,
                         help="skip this many of the most recent days (walk-back)")
-    parser.add_argument("--config", default=str(BASE / "config.json"))
+    parser.add_argument("--config", default=None)
     parser.add_argument("--sl-mode", choices=["zone_opposite", "retest_swing"])
     parser.add_argument("--entry-mode", choices=["limit", "retest_close"])
     parser.add_argument("--tp-r", type=float)
@@ -55,7 +57,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def load_history(cfg: dict, days: int):
-    feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)))
+    client = build_client(cfg)
+    feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)), client)
     feed.start()
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days + 45)
@@ -106,7 +109,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.WARNING)
 
-    with open(args.config, encoding="utf-8") as f:
+    with open(config_path(args.config), encoding="utf-8") as f:
         cfg = json.load(f)
     cfg = apply_overrides(cfg, args)
     tz = ZoneInfo(cfg["timezone"])

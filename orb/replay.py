@@ -29,6 +29,8 @@ def replay(
     tz,
     days: int | None = None,
     offset: int = 0,
+    start_date=None,
+    end_date=None,
 ) -> tuple[list[Signal], list, int]:
     """Replay the strategy day by day. Returns (signals, days_list, skipped_days)."""
     trend_at = build_trend_fn(h1, cfg["trend"], tz)
@@ -41,6 +43,10 @@ def replay(
         orb_by_day.setdefault(b.open_time.astimezone(tz).date(), []).append(b)
 
     day_list = sorted(by_day)
+    if start_date:
+        day_list = [d for d in day_list if d >= start_date]
+    if end_date:
+        day_list = [d for d in day_list if d <= end_date]
     if offset:
         day_list = day_list[:-offset] if offset < len(day_list) else []
     if days:

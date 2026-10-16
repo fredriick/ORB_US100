@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from backtest import load_history
 from orb.replay import effective_cost_points, max_drawdown, net_r, replay, summarize, windows
+from orb.settings import config_path
 
 BASE = Path(__file__).resolve().parent
 
@@ -115,7 +116,7 @@ def run_symbol(symbol, base_cfg, args):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Robust walk-forward config selector")
-    parser.add_argument("--config", default=str(BASE / "config.json"))
+    parser.add_argument("--config", default=None)
     parser.add_argument("--days", type=int, default=150)
     parser.add_argument("--folds", type=int, default=4)
     parser.add_argument("--symbol", default=None)
@@ -131,7 +132,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.WARNING)
 
-    with open(args.config, encoding="utf-8") as f:
+    with open(config_path(args.config), encoding="utf-8") as f:
         base_cfg = json.load(f)
     symbols = [args.symbol or base_cfg["symbol"]]
     if args.symbols:

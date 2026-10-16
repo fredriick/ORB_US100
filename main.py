@@ -14,7 +14,9 @@ from orb.engine import OrbEngine
 from orb.executor import Executor
 from orb.feed import Mt5Feed
 from orb.ledger import TradeLedger
+from orb.mt5_client import build_client
 from orb.notify import Notifier
+from orb.settings import artifact, config_path
 from orb.trend import TrendProvider
 
 BASE = Path(__file__).resolve().parent
@@ -27,7 +29,7 @@ def setup_logging() -> None:
     for handler in (
         logging.StreamHandler(sys.stdout),
         logging.handlers.RotatingFileHandler(
-            BASE / "bot.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8"
+            artifact("bot.log"), maxBytes=2_000_000, backupCount=5, encoding="utf-8"
         ),
     ):
         handler.setFormatter(fmt)
@@ -56,10 +58,27 @@ def today_realized_r(engine: OrbEngine) -> float:
     return sum(s.realized_r for s in engine.signals if s.outcome in ("TP", "SL", "EOD"))
 
 
+def startup_gate(client, cfg: dict, log: logging.Logger) -> bool:
+    """Verify the terminal is healthy and algo trading is enabled."""
+    client.ensure_algo_trading()
+    health = client.health()
+    log.info(
+        "terminal health | connected=%s trade_allowed=%s",
+        health.connected,
+        health.trade_allowed,
+    )
+    if not health.connected:
+        log.warning("terminal reports NOT connected - orders will not be placed")
+    elif not health.trade_allowed:
+        log.warning("terminal reports trading NOT allowed (AutoTrading off?)")
+    return health.connected
+
+
 def run_self_test(cfg: dict, log: logging.Logger) -> int:
-    feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)))
+    client = build_client(cfg)
+    feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)), client)
     feed.start()
-    executor = Executor(cfg["symbol"], cfg)
+    executor = Executor(cfg["symbol"], cfg, client)
     try:
         ok = executor.self_test()
     finally:
@@ -70,15 +89,19 @@ def run_self_test(cfg: dict, log: logging.Logger) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="NAS100 ORB signal bot (MT5)")
-    parser.add_argument("--config", default=str(BASE / "config.json"))
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--transport", choices=["local", "http"],
+                        help="override config transport (local IPC or HTTP API)")
     parser.add_argument("--live", action="store_true",
                         help="override live_trading and actually place orders")
     parser.add_argument("--selftest", action="store_true",
                         help="validate the MT5 order pipeline (order_check) and exit")
     args = parser.parse_args()
 
-    with open(args.config, encoding="utf-8") as f:
+    with open(config_path(args.config), encoding="utf-8") as f:
         cfg = json.load(f)
+    if args.transport:
+        cfg["transport"] = args.transport
     if args.live:
         cfg["live_trading"] = True
 
@@ -95,11 +118,13 @@ def main() -> None:
         log.info("signal-only mode (set live_trading=true or pass --live to trade)")
 
     tz = ZoneInfo(cfg["timezone"])
-    feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)))
+    client = build_client(cfg)
+    feed = Mt5Feed(cfg["symbol"], int(cfg.get("server_offset_sec_fallback", 10800)), client)
     feed.start()
+    startup_gate(client, cfg, log)
     trend = TrendProvider(feed, cfg["trend"], tz)
-    ledger = TradeLedger(str(BASE / "trades.csv"))
-    executor = Executor(cfg["symbol"], cfg)
+    ledger = TradeLedger(str(artifact("trades.csv")))
+    executor = Executor(cfg["symbol"], cfg, client)
     notifier = Notifier(cfg)
     max_daily_loss_r = float(cfg.get("risk", {}).get("max_daily_loss_r", 0.0))
 

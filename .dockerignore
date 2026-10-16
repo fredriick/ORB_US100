@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.git/
+.gitignore
+data/
+.env
+bot.log
+trades.csv
+*.tmp
+README.md
+tests/

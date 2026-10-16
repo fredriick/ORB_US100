@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from backtest import load_history
 from orb.replay import effective_cost_points, replay, summarize
+from orb.settings import config_path
 
 BASE = Path(__file__).resolve().parent
 
@@ -20,7 +21,7 @@ def parse_list(value: str, cast):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Parameter sweep / robustness check")
     parser.add_argument("--days", type=int, default=150)
-    parser.add_argument("--config", default=str(BASE / "config.json"))
+    parser.add_argument("--config", default=None)
     parser.add_argument("--sl-modes", default="retest_swing")
     parser.add_argument("--entry-modes", default="retest_close,limit")
     parser.add_argument("--tp-rs", default="1.5,2.0,2.5")
@@ -32,7 +33,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.WARNING)
 
-    with open(args.config, encoding="utf-8") as f:
+    with open(config_path(args.config), encoding="utf-8") as f:
         base_cfg = json.load(f)
     tz = ZoneInfo(base_cfg["timezone"])
 

@@ -4,58 +4,54 @@ import logging
 import time
 from datetime import datetime, timezone
 
-import MetaTrader5 as mt5
-
 from .models import Bar
+from .mt5_client import Mt5Client, TF_NAME, build_client
 
 log = logging.getLogger("orb.feed")
 
-_TF = {
-    1: mt5.TIMEFRAME_M1,
-    5: mt5.TIMEFRAME_M5,
-    15: mt5.TIMEFRAME_M15,
-    30: mt5.TIMEFRAME_M30,
-    60: mt5.TIMEFRAME_H1,
-    240: mt5.TIMEFRAME_H4,
-    1440: mt5.TIMEFRAME_D1,
-}
-
 
 class Mt5Feed:
-    """Thin MetaTrader 5 adapter.
+    """Market-data adapter over an Mt5Client (local IPC or HTTP API).
 
     MT5 timestamps are server-clock epochs (FBS = UTC+3). This class detects
     the live server offset from the last tick and converts everything to real
     UTC so session logic can use IANA timezones (America/New_York).
     """
 
-    def __init__(self, symbol: str, fallback_offset: int = 10800):
+    def __init__(self, symbol: str, fallback_offset: int = 10800, client: Mt5Client | None = None):
         self.symbol = symbol
         self._offset = int(fallback_offset)
         self._offset_known = False
+        self.client = client or build_client({"transport": "local"})
 
     def start(self) -> None:
-        if not mt5.initialize():
-            raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
-        if not mt5.symbol_select(self.symbol, True):
-            mt5.shutdown()
-            raise RuntimeError(f"symbol {self.symbol} not available: {mt5.last_error()}")
-        info = mt5.symbol_info(self.symbol)
-        ai = mt5.account_info()
+        self.client.start()
+        info = self.client.symbol_info(self.symbol)
+        if info is None or not info.visible:
+            self.client.select_symbol(self.symbol)
+            info = self.client.symbol_info(self.symbol)
+        if info is None:
+            self.client.shutdown()
+            raise RuntimeError(f"symbol {self.symbol} not available: {self.client.last_error()}")
+        try:
+            ai = self.client.account_info()
+            server, login = ai.server, ai.login
+        except Exception:  # noqa: BLE001 - server/login are cosmetic
+            server, login = "?", 0
         self._detect_offset()
         log.info(
             "MT5 connected | %s | server %s login %s | %s digits=%d | server offset %+ds",
             info.name,
-            ai.server,
-            ai.login,
+            server,
+            login,
             self.symbol,
             info.digits,
             self._offset,
         )
 
     def _detect_offset(self) -> None:
-        tick = mt5.symbol_info_tick(self.symbol)
-        if tick is not None:
+        tick = self.client.tick(self.symbol)
+        if tick is not None and tick.time:
             self._offset = int(round((tick.time - time.time()) / 60.0)) * 60
             self._offset_known = True
 
@@ -65,20 +61,22 @@ class Mt5Feed:
 
     def ensure_connection(self) -> bool:
         """Re-establish the terminal connection if it dropped. Returns health."""
-        ti = mt5.terminal_info()
-        if ti is None or not ti.connected:
+        health = self.client.health()
+        if not health.connected:
             log.warning("MT5 terminal not connected - reinitializing")
-            if not mt5.initialize():
-                log.error("reinitialize failed: %s", mt5.last_error())
+            try:
+                self.client.start()
+            except Exception as exc:  # noqa: BLE001
+                log.error("reinitialize failed: %s", exc)
                 return False
             log.info("MT5 reconnected")
         self._ensure_symbol()
         return True
 
     def _ensure_symbol(self) -> None:
-        info = mt5.symbol_info(self.symbol)
+        info = self.client.symbol_info(self.symbol)
         if info is None or not info.visible:
-            mt5.symbol_select(self.symbol, True)
+            self.client.select_symbol(self.symbol)
 
     def _convert(self, raw, tf_minutes: int, offset: int) -> list[Bar]:
         now_raw = time.time() + offset
@@ -102,37 +100,37 @@ class Mt5Feed:
         return out
 
     def bars(self, tf_minutes: int, count: int) -> list[Bar]:
-        if tf_minutes not in _TF:
+        if tf_minutes not in TF_NAME:
             raise ValueError(f"unsupported timeframe: {tf_minutes}m")
         self._ensure_symbol()
         self._detect_offset()
         offset = self._offset
-        raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
+        raw = self.client.rates(self.symbol, tf_minutes, count)
         if raw is None:
-            log.warning("copy_rates_from_pos(%dm) failed: %s", tf_minutes, mt5.last_error())
+            log.warning("rates(%dm) failed: %s", tf_minutes, self.client.last_error())
             if not self.ensure_connection():
                 return []
-            raw = mt5.copy_rates_from_pos(self.symbol, _TF[tf_minutes], 0, count)
+            raw = self.client.rates(self.symbol, tf_minutes, count)
             if raw is None:
-                log.error("copy_rates_from_pos(%dm) still failing after reconnect", tf_minutes)
+                log.error("rates(%dm) still failing after reconnect", tf_minutes)
                 return []
         return self._convert(raw, tf_minutes, offset)
 
     def bars_range(self, tf_minutes: int, start, end) -> list[Bar]:
         """Bars between two datetimes (triggers on-demand history download)."""
-        if tf_minutes not in _TF:
+        if tf_minutes not in TF_NAME:
             raise ValueError(f"unsupported timeframe: {tf_minutes}m")
         self._ensure_symbol()
         self._detect_offset()
         offset = self._offset
-        raw = mt5.copy_rates_range(self.symbol, _TF[tf_minutes], start, end)
+        raw = self.client.rates_range(self.symbol, tf_minutes, start, end)
         if raw is None or len(raw) == 0:
-            log.warning("copy_rates_range(%dm) returned nothing: %s", tf_minutes, mt5.last_error())
+            log.warning("rates_range(%dm) returned nothing: %s", tf_minutes, self.client.last_error())
             if self.ensure_connection():
-                raw = mt5.copy_rates_range(self.symbol, _TF[tf_minutes], start, end)
+                raw = self.client.rates_range(self.symbol, tf_minutes, start, end)
             if raw is None or len(raw) == 0:
                 return []
         return self._convert(raw, tf_minutes, offset)
 
     def shutdown(self) -> None:
-        mt5.shutdown()
+        self.client.shutdown()

@@ -1,0 +1,4 @@
+# Local (Windows) transport: direct MetaTrader5 IPC.
+# Install on top of the core requirements when running against a local terminal.
+-r requirements.txt
+MetaTrader5>=5.0.45

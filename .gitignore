@@ -9,3 +9,5 @@ bot.log
 trades.csv
 trades.csv.tmp
 *.tmp
+data/
+.env
