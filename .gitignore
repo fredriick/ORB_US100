@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# runtime artifacts
+bot.log
+trades.csv
+trades.csv.tmp
+*.tmp

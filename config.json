@@ -1,0 +1,36 @@
+{
+  "symbol": "US100",
+  "live_trading": false,
+  "poll_seconds": 10,
+  "timezone": "America/New_York",
+  "session_open_local": "09:30",
+  "session_cutoff_local": "16:00",
+  "orb_timeframe_minutes": 15,
+  "entry_timeframe_minutes": 5,
+  "min_zone_range": 5.0,
+  "entry_mode": "retest_close",
+  "sl_mode": "retest_swing",
+  "sl_buffer": 1.0,
+  "min_risk_points": 20.0,
+  "tp_r": 2.0,
+  "exit_at_cutoff": true,
+  "retest_buffer": 0.0,
+  "retest_timeout_bars": 12,
+  "allow_rearm": false,
+  "max_signals_per_day": 1,
+  "trend": {
+    "enabled": true,
+    "timeframe_minutes": 60,
+    "ema_fast": 50,
+    "ema_slow": 200
+  },
+  "server_offset_sec_fallback": 10800,
+  "execution": {
+    "lot_mode": "risk_percent",
+    "risk_percent": 1.0,
+    "fixed_lot": 0.01,
+    "max_lot": 5.0,
+    "deviation_points": 50,
+    "magic": 20261014
+  }
+}
