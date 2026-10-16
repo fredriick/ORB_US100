@@ -137,7 +137,10 @@ python sweep.py --days 150
 # 6. Trend-filter lab (compares filter variants, no orders/writes)
 python trendlab.py --days 150 --symbols US500,US30
 
-# 7. Tests
+# 7. Robust walk-forward parameter selection
+python select.py --days 150 --folds 4 --symbol US100 --symbols US30
+
+# 8. Tests
 python -m unittest discover -s tests
 ```
 
@@ -234,6 +237,29 @@ Conclusion: the edge lives in the ORB breakout/retest mechanics and stop placeme
 in the higher-timeframe trend. The filter is therefore **off by default**, but the
 machinery is kept and selectable (`trend.enabled`, `trend.method`) for research.
 
+### Selecting parameters (robust walk-forward)
+
+`select.py` replays a small, principled grid over `N` independent time folds and ranks
+candidates by **worst-fold net R** (robustness first), then net R:
+
+```bash
+python select.py --days 150 --folds 4 --symbol US100 --symbols US30
+```
+
+On US100 the winner is exactly the shipped default — `retest_close` / `retest_swing` /
+TP **2.0R** / `min_risk_points` **20** / trend **off**: 105 trades, 58.1% WR, **+62.4R**
+net, worst fold **+10.6R**, positive in **4/4** folds.
+
+- `min_risk` 20/25/30 were all tested — 20 wins. Combined with `sweep.py` (where
+  `min_risk 10` only "wins" via sub-spread stops) this confirms the floor is load-bearing
+  and not free.
+- US30 over the same period prefers TP **1.5R**; `tp 1.5 / min_risk 20 / trend off` is the
+  most cross-instrument-robust setting (4/4 folds positive on *both* symbols, best US30
+  return/DD). TP 2.0R stays the default because US100 is the primary symbol with the
+  larger, more stable edge.
+- **Caveat:** the "worst-fold" objective mildly favours configs with *fewer* trades (fewer
+  trades → smaller fold variance). Read it alongside net R, not on its own.
+
 ### Honest caveats
 
 - **Stop placement dominates the edge.** The wide `zone_opposite` stop is negative on
@@ -256,6 +282,7 @@ ORB/
 ├── backtest.py        # replay over MT5 history (--windows, --offset, cost knobs)
 ├── sweep.py           # parameter robustness grid
 ├── trendlab.py        # trend-filter variant comparison + significance
+├── select.py          # robust walk-forward config selection
 ├── config.json        # all parameters
 ├── requirements.txt
 ├── orb/

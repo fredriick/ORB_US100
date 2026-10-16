@@ -72,6 +72,20 @@ def replay(
     return signals, day_list, skipped
 
 
+def net_r(sig: Signal, cost_points: float) -> float:
+    return sig.realized_r - (cost_points / sig.risk if sig.risk else 0.0)
+
+
+def max_drawdown(signals: list[Signal], cost_points: float) -> float:
+    """Worst peak-to-trough of the cumulative net-R curve (<= 0)."""
+    eq = peak = dd = 0.0
+    for s in sorted(signals, key=lambda s: s.signal_time):
+        eq += net_r(s, cost_points)
+        peak = max(peak, eq)
+        dd = min(dd, eq - peak)
+    return dd
+
+
 def summarize(signals: list[Signal], cost_points: float, days: int, skipped: int) -> dict:
     sig = signals
     tp = sum(1 for s in sig if s.outcome == "TP")
